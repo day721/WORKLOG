@@ -5,10 +5,18 @@ from github import Github, GithubException
 from datetime import datetime, timedelta, date, time
 from fpdf import FPDF
 
-# App Config
+# --- APP CONFIG & STYLING ---
 st.set_page_config(page_title="Shift Tracker Pro", layout="wide")
 
-# --- GITHUB SETUP ---
+# Custom CSS for better mobile appearance
+st.markdown("""
+    <style>
+    .stButton > button { width: 100%; border-radius: 10px; height: 3em; }
+    .stMetric { background-color: #f0f2f6; padding: 10px; border-radius: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- SETTINGS & GITHUB ---
 try:
     GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
     REPO_NAME = st.secrets["REPO_NAME"]
@@ -16,138 +24,146 @@ try:
     g = Github(GITHUB_TOKEN)
     repo = g.get_repo(REPO_NAME)
 except Exception:
-    st.error("Check Streamlit Secrets! GITHUB_TOKEN, REPO_NAME, and FILE_PATH must be set.")
+    st.error("Missing Secrets! Check GITHUB_TOKEN, REPO_NAME, and FILE_PATH.")
     st.stop()
 
-# Bahrain Time Adjustment (UTC + 3)
 def get_bahrain_now():
     return datetime.utcnow() + timedelta(hours=3)
 
-# --- DATA ENGINE ---
+# --- DATA OPERATIONS ---
 def load_data():
     try:
         content = repo.get_contents(FILE_PATH)
         df = pd.read_csv(io.StringIO(content.decoded_content.decode()))
         df['Date'] = df['Date'].astype(str)
+        # Handle empty/NaN values for times
+        df['Check-In'] = df['Check-In'].fillna("")
+        df['Check-Out'] = df['Check-Out'].fillna("")
         return df, content.sha
     except Exception:
         return pd.DataFrame(columns=["Date", "Shift", "Check-In", "Check-Out", "Total Minutes"]), None
 
-def save_to_github(df, sha):
+def save_data(df, sha):
     csv_content = df.to_csv(index=False)
-    if sha:
-        repo.update_file(FILE_PATH, "Update Shift Log", csv_content, sha)
-    else:
-        repo.create_file(FILE_PATH, "Initialize Log", csv_content)
+    try:
+        repo.update_file(FILE_PATH, "Update Shift Data", csv_content, sha)
+        return True
+    except Exception as e:
+        st.error(f"GitHub Error: {e}")
+        return False
 
-# --- INITIALIZE SESSION STATE ---
-# This prevents manual time from resetting to 'current' on every click
-if 'manual_in_time' not in st.session_state:
-    st.session_state.manual_in_time = get_bahrain_now().time()
-if 'manual_out_time' not in st.session_state:
-    st.session_state.manual_out_time = get_bahrain_now().time()
+def calculate_minutes(start_str, end_str):
+    if not start_str or not end_str: return 0
+    try:
+        t1 = datetime.strptime(start_str, "%H:%M")
+        t2 = datetime.strptime(end_str, "%H:%M")
+        # Handle overnight shift
+        if t2 < t1:
+            t2 += timedelta(days=1)
+        return int((t2 - t1).total_seconds() / 60)
+    except: return 0
 
-# --- MAIN UI ---
-st.title("🕒 Quick Shift Logger")
+# --- INITIALIZATION ---
+df, sha = load_data()
 now = get_bahrain_now()
 today_str = now.strftime("%Y-%m-%d")
 
+# --- MAIN UI ---
+st.title("🕒 Daily Shift Tracker")
+
 # 1. SHIFT SELECTION
-shift_type = st.radio("Current Shift:", ["Shift 1", "Shift 2"], horizontal=True)
+shift_num = st.radio("Select Shift:", ["Shift 1", "Shift 2", "Shift 3", "Shift 4"], horizontal=True)
 
-# 2. ONE-CLICK BUTTONS
-st.subheader("Quick Actions")
-col1, col2 = st.columns(2)
-
-df, sha = load_data()
-mask = (df['Date'] == today_str) & (df['Shift'] == shift_type)
+# Find if a record exists for today + this shift
+mask = (df['Date'] == today_str) & (df['Shift'] == shift_num)
 existing_idx = df.index[mask].tolist()
 
-with col1:
-    if st.button("🟢 CHECK IN NOW", use_container_width=True):
+# 2. THE MORNING/EVENING BUTTONS
+st.subheader("Quick Log")
+c1, c2 = st.columns(2)
+
+with c1:
+    if st.button("🟢 MORNING: CHECK IN", type="primary"):
         current_t = get_bahrain_now().strftime("%H:%M")
         if not existing_idx:
-            new_row = pd.DataFrame([{"Date": today_str, "Shift": shift_type, "Check-In": current_t, "Check-Out": "", "Total Minutes": 0}])
+            # Create NEW record with only Check-In
+            new_row = pd.DataFrame([{"Date": today_str, "Shift": shift_num, "Check-In": current_t, "Check-Out": "", "Total Minutes": 0}])
             df = pd.concat([df, new_row], ignore_index=True)
         else:
+            # Update existing record's Check-In
             df.at[existing_idx[0], "Check-In"] = current_t
-        save_to_github(df, sha)
-        st.success(f"Checked In: {current_t}")
-        st.rerun()
-
-with col2:
-    if st.button("🔴 CHECK OUT NOW", use_container_width=True):
-        if not existing_idx:
-            st.error("No Check-In found! Please Check In first.")
-        else:
-            current_t = get_bahrain_now().strftime("%H:%M")
-            df.at[existing_idx[0], "Check-Out"] = current_t
-            
-            # Duration Calculation
-            in_t = datetime.strptime(df.at[existing_idx[0], "Check-In"], "%H:%M")
-            out_t = datetime.strptime(current_t, "%H:%M")
-            delta = (out_t - in_t).total_seconds() / 60
-            df.at[existing_idx[0], "Total Minutes"] = int(delta)
-            
-            save_to_github(df, sha)
-            st.success(f"Checked Out: {current_t}")
+            df.at[existing_idx[0], "Total Minutes"] = calculate_minutes(current_t, df.at[existing_idx[0], "Check-Out"])
+        
+        if save_data(df, sha):
+            st.success(f"Check-In saved: {current_t}")
             st.rerun()
 
-# 3. MANUAL EDIT (Persistent State)
-with st.expander("✏️ Edit or Add Time Manually"):
-    m_date = st.date_input("Date to Edit", now.date())
-    
-    # These will use the OS native clock picker on mobile
-    m_in = st.time_input("Set Check-In", key="manual_in_widget", value=st.session_state.manual_in_time)
-    m_out = st.time_input("Set Check-Out", key="manual_out_widget", value=st.session_state.manual_out_time)
-    
-    # Update session state whenever these change
-    st.session_state.manual_in_time = m_in
-    st.session_state.manual_out_time = m_out
-
-    if st.button("Update Entry", use_container_width=True):
-        m_date_str = m_date.strftime("%Y-%m-%d")
-        m_mask = (df['Date'] == m_date_str) & (df['Shift'] == shift_type)
-        m_idx = df.index[m_mask].tolist()
-        
-        in_str = m_in.strftime("%H:%M")
-        out_str = m_out.strftime("%H:%M")
-        
-        # Calculation for manual entry
-        in_dt = datetime.combine(date.today(), m_in)
-        out_dt = datetime.combine(date.today(), m_out)
-        m_delta = int((out_dt - in_dt).total_seconds() / 60)
-
-        if not m_idx:
-            new_row = pd.DataFrame([{"Date": m_date_str, "Shift": shift_type, "Check-In": in_str, "Check-Out": out_str, "Total Minutes": m_delta}])
+with c2:
+    if st.button("🔴 AFTERNOON: CHECK OUT"):
+        current_t = get_bahrain_now().strftime("%H:%M")
+        if not existing_idx:
+            st.warning("No Check-In found. Creating one with default 08:00...")
+            new_row = pd.DataFrame([{"Date": today_str, "Shift": shift_num, "Check-In": "08:00", "Check-Out": current_t, "Total Minutes": calculate_minutes("08:00", current_t)}])
             df = pd.concat([df, new_row], ignore_index=True)
         else:
-            df.at[m_idx[0], "Check-In"] = in_str
-            df.at[m_idx[0], "Check-Out"] = out_str
-            df.at[m_idx[0], "Total Minutes"] = m_delta
+            df.at[existing_idx[0], "Check-Out"] = current_t
+            df.at[existing_idx[0], "Total Minutes"] = calculate_minutes(df.at[existing_idx[0], "Check-In"], current_t)
         
-        save_to_github(df, sha)
-        st.success("Manual Entry Updated!")
-        st.rerun()
+        if save_data(df, sha):
+            st.success(f"Check-Out saved: {current_t}")
+            st.rerun()
 
-# --- REPORTS & EXPORT ---
+# 3. MANUAL EDIT / DELETE SECTION
+st.divider()
+with st.expander("🛠️ Manage / Remove Records"):
+    st.write("Edit or Delete specific entries below:")
+    
+    # Let user select a date to manage
+    edit_date = st.date_input("Target Date", now.date())
+    edit_date_str = edit_date.strftime("%Y-%m-%d")
+    
+    # Filter data for that day
+    day_data = df[df['Date'] == edit_date_str]
+    
+    if day_data.empty:
+        st.info("No records for this date.")
+    else:
+        for idx, row in day_data.iterrows():
+            with st.container():
+                cols = st.columns([2, 2, 2, 1])
+                # Native Clock Picker (st.time_input)
+                new_in = cols[0].time_input(f"In ({row['Shift']})", value=datetime.strptime(row['Check-In'], "%H:%M").time() if row['Check-In'] else now.time(), key=f"in_{idx}")
+                new_out = cols[1].time_input(f"Out ({row['Shift']})", value=datetime.strptime(row['Check-Out'], "%H:%M").time() if row['Check-Out'] else now.time(), key=f"out_{idx}")
+                
+                # Update Button
+                if cols[2].button("💾 Save", key=f"save_{idx}"):
+                    df.at[idx, "Check-In"] = new_in.strftime("%H:%M")
+                    df.at[idx, "Check-Out"] = new_out.strftime("%H:%M")
+                    df.at[idx, "Total Minutes"] = calculate_minutes(df.at[idx, "Check-In"], df.at[idx, "Check-Out"])
+                    if save_data(df, sha):
+                        st.success("Updated!")
+                        st.rerun()
+                
+                # Remove Button
+                if cols[3].button("🗑️", key=f"del_{idx}"):
+                    df = df.drop(idx)
+                    if save_data(df, sha):
+                        st.error("Deleted!")
+                        st.rerun()
+
+# 4. VIEW LOGS
 st.divider()
 if not df.empty:
     df['Date_DT'] = pd.to_datetime(df['Date'])
     df['Month'] = df['Date_DT'].dt.strftime('%B %Y')
     
-    view_month = st.selectbox("Monthly Overview", df['Month'].unique())
+    view_month = st.selectbox("Monthly Report", df['Month'].unique(), index=len(df['Month'].unique())-1)
     report_df = df[df['Month'] == view_month].copy()
     
-    total_m = int(report_df['Total Minutes'].sum())
+    total_min = int(report_df['Total Minutes'].sum())
+    m1, m2 = st.columns(2)
+    m1.metric("Total Hours", f"{total_min/60:.2f}h")
+    m2.metric("Days Worked", len(report_df['Date'].unique()))
     
-    # Compact Metrics for Mobile
-    c1, c2 = st.columns(2)
-    c1.metric("Total Hours", f"{total_m/60:.2f}h")
-    c2.metric("Total Minutes", f"{total_m}m")
-    
-    # Hide technical columns for mobile display
-    st.dataframe(report_df[["Date", "Shift", "Check-In", "Check-Out", "Total Minutes"]], 
+    st.dataframe(report_df[["Date", "Shift", "Check-In", "Check-Out", "Total Minutes"]].sort_values("Date", ascending=False), 
                  use_container_width=True, hide_index=True)
-else:
-    st.info("No records yet.")
