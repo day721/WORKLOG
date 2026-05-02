@@ -1,23 +1,16 @@
 import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import datetime, date
 
 # App Configuration
 st.set_page_config(page_title="Work Shift Tracker", layout="centered")
 
-# Data Storage Setup
-DATA_FILE = "work_logs.csv"
+# Establish Google Sheets Connection
+conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_data():
-    try:
-        df = pd.read_csv(DATA_FILE)
-        df['Date'] = pd.to_datetime(df['Date']).dt.date
-        return df
-    except FileNotFoundError:
-        return pd.DataFrame(columns=["Date", "Shift", "Check-In", "Check-Out", "Total Minutes"])
-
-def save_data(df):
-    df.to_csv(DATA_FILE, index=False)
+    return conn.read(worksheet="Sheet1", ttl="0")
 
 # UI Header
 st.title("🕒 Daily Shift Tracker")
@@ -28,31 +21,35 @@ with st.sidebar:
     today = st.date_input("Date", date.today())
     shift_type = st.selectbox("Shift Type", ["Shift 1", "Shift 2"])
     
-    # Time Inputs
     check_in = st.time_input("Check-In Time", datetime.now().time())
     check_out = st.time_input("Check-Out Time", datetime.now().time())
     
-    if st.button("Save Record"):
-        # Calculate duration
+    if st.button("Save to Google Sheets"):
         start_dt = datetime.combine(today, check_in)
         end_dt = datetime.combine(today, check_out)
         
-        # Handle overnight shifts if necessary
         if end_dt < start_dt:
             st.error("Check-out cannot be before Check-in.")
         else:
             diff = end_dt - start_dt
             total_minutes = int(diff.total_seconds() / 60)
             
-            new_data = pd.DataFrame([[
-                today, shift_type, check_in.strftime("%H:%M"), 
-                check_out.strftime("%H:%M"), total_minutes
-            ]], columns=["Date", "Shift", "Check-In", "Check-Out", "Total Minutes"])
+            # Prepare new row
+            new_row = pd.DataFrame([{
+                "Date": today.strftime("%Y-%m-%d"),
+                "Shift": shift_type,
+                "Check-In": check_in.strftime("%H:%M"),
+                "Check-Out": check_out.strftime("%H:%M"),
+                "Total Minutes": total_minutes
+            }])
             
-            df = load_data()
-            df = pd.concat([df, new_data], ignore_index=True)
-            save_data(df)
-            st.success("Record Saved!")
+            # Read existing data and append
+            existing_data = load_data()
+            updated_df = pd.concat([existing_data, new_row], ignore_index=True)
+            
+            # Update the Google Sheet
+            conn.update(worksheet="Sheet1", data=updated_df)
+            st.success("Data synced to Google Sheets!")
 
 # Main Dashboard
 df = load_data()
@@ -60,21 +57,20 @@ df = load_data()
 if not df.empty:
     st.subheader("Monthly Report")
     
-    # Filter by Month
-    df['Month'] = pd.to_datetime(df['Date']).dt.strftime('%B %Y')
-    selected_month = st.selectbox("Select Month", df['Month'].unique())
+    # Ensure Date column is datetime
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['Month'] = df['Date'].dt.strftime('%B %Y')
+    
+    unique_months = df['Month'].unique()
+    selected_month = st.selectbox("Select Month", unique_months)
     
     month_df = df[df['Month'] == selected_month]
     
-    # Calculations
-    total_min = month_df['Total Minutes'].sum()
+    total_min = pd.to_numeric(month_df['Total Minutes']).sum()
     total_hrs = total_min / 60
     
-    # Display Stats
     col1, col2 = st.columns(2)
     col1.metric("Total Hours", f"{total_hrs:.2f} hrs")
     col2.metric("Total Minutes", f"{total_min} min")
     
     st.dataframe(month_df[["Date", "Shift", "Check-In", "Check-Out", "Total Minutes"]], use_container_width=True)
-else:
-    st.info("No records found. Start by logging a shift in the sidebar.")
